@@ -1,0 +1,860 @@
+diff --git a/libfprint/drivers/elanspi.c b/libfprint/drivers/elanspi.c
+index 9338013..097232d 100644
+--- a/libfprint/drivers/elanspi.c
++++ b/libfprint/drivers/elanspi.c
+@@ -30,6 +30,7 @@
+ #include <sys/stat.h>
+ #include <linux/types.h>
+ #include <errno.h>
++#include <stdio.h>
+ 
+ struct _FpiDeviceElanSpi
+ {
+@@ -78,10 +79,33 @@ struct _FpiDeviceElanSpi
+   gint     fp_empty_counter;
+   GSList  *fp_frame_list;
+ 
++  /* statistics of the most recent elanspi_guess_image() call */
++  gint64 last_guess_sq_stddev;
++  gint   last_guess_invalid_percent;
++
++  /* press (place-and-hold) capture */
++  gboolean press_mode;
++  guint16 *press_frames;        /* ELANSPI_PRESS_SAMPLE_FRAMES bg-corrected raw frames */
++  gint64   press_quality[ELANSPI_PRESS_SAMPLE_FRAMES];
++  guint    press_count;
++  guint    press_settle;
++
++  /* background validation (press mode): the image is submitted while the
++   * finger is still down, so the next activation may calibrate on a finger */
++  gboolean calib_converged;
++  guint16  calib_gdac;
++  guint16 *good_bg;             /* last background taken on an empty sensor */
++  guint16  good_gdac;
++  gint64   good_bg_time;        /* monotonic usec when good_bg was taken */
++  gboolean calib_reuse;         /* this activation restores good_gdac/good_bg */
++  guint    calib_retries;
++
+   /* wait ctx */
+   gint     finger_wait_debounce;
+ 
+   gboolean deactivating, capturing;
++  /* the capturer that currently owns the capturing/deactivating flags */
++  FpiSsm  *capture_ssm;
+ 
+   /* active SPI status info */
+   int spi_fd;
+@@ -128,7 +152,7 @@ out:
+  *   - initialization (device type detection)
+  *   - calibration
+  *      - image capture (single)
+- *   - image capture (stitched)
++ *   - image capture (stitched swipe, or a single full frame in press mode)
+  */
+ 
+ enum elanspi_init_state {
+@@ -397,8 +421,32 @@ elanspi_determine_sensor (FpiDeviceElanSpi *self, GError **err)
+       return;
+     }
+ 
++  /* press mode needs a square area sensor: the full frame is the image */
++  self->press_mode = FALSE;
++  if (fpi_device_get_driver_data (FP_DEVICE (self)) & ELANSPI_PRESS_MODE)
++    {
++      if (self->sensor_width == self->sensor_height)
++        {
++          self->press_mode = TRUE;
++        }
++      else
++        {
++          fp_warn ("<init/detect> press mode requested but sensor is %dx%d; using swipe capture",
++                   self->sensor_width, self->sensor_height);
++          fpi_device_set_scan_type (FP_DEVICE (self), FP_SCAN_TYPE_SWIPE);
++          fpi_device_set_nr_enroll_stages (FP_DEVICE (self),
++                                           FP_DEVICE_GET_CLASS (self)->nr_enroll_stages);
++        }
++    }
++
+   /* setup frame size */
+-  if (fpi_device_get_driver_data (FP_DEVICE (self)) & ELANSPI_HV_FLIPPED)
++  if (self->press_mode)
++    {
++      self->frame_width = self->sensor_width;
++      self->frame_height = self->sensor_height;
++      fp_dbg ("<init/detect> press mode, full %dx%d frame", self->frame_width, self->frame_height);
++    }
++  else if (fpi_device_get_driver_data (FP_DEVICE (self)) & ELANSPI_HV_FLIPPED)
+     {
+       self->frame_width = self->sensor_height;
+       self->frame_height = self->sensor_width > ELANSPI_MAX_FRAME_HEIGHT ? ELANSPI_MAX_FRAME_HEIGHT : self->sensor_width;
+@@ -802,6 +850,8 @@ elanspi_calibrate_hv_handler (FpiSsm *ssm, FpDevice *dev)
+       self->hv_data.gdac_step  = 0x100;
+       self->hv_data.best_gdac  = 0x0;
+       self->hv_data.best_meandiff = 0xffff;
++      if (self->calib_reuse)
++        self->hv_data.gdac_value = self->good_gdac;
+ 
+     case ELANSPI_CALIBHV_SELECT_PAGE0_1:
+       xfer = elanspi_do_selectpage (self, 0);
+@@ -872,11 +922,23 @@ elanspi_calibrate_hv_handler (FpiSsm *ssm, FpDevice *dev)
+       return;
+ 
+     case ELANSPI_CALIBHV_PROCESS:
++      if (self->calib_reuse)
++        {
++          /* gain restored from a recent good calibration; no search, so a
++           * finger on the sensor cannot disturb it */
++          fp_dbg ("<calibhv> reusing calibration (gdac=%04x)", self->hv_data.gdac_value);
++          self->calib_converged = TRUE;
++          self->calib_gdac = self->hv_data.gdac_value;
++          fpi_ssm_jump_to_state (ssm, ELANSPI_CALIBHV_PROTECT);
++          return;
++        }
+       /* compute mean */
+       mean_diff = abs (elanspi_mean_image (self, self->last_image) - ELANSPI_HV_CALIBRATION_TARGET_MEAN);
+       if (mean_diff < 100)
+         {
+           fp_dbg ("<calibhv> calibration ok (mdiff < 100 w/ gdac=%04x)", self->hv_data.gdac_value);
++          self->calib_converged = TRUE;
++          self->calib_gdac = self->hv_data.gdac_value;
+           /* exit early, jump right to protect */
+           fpi_ssm_jump_to_state (ssm, ELANSPI_CALIBHV_PROTECT);
+           return;
+@@ -891,6 +953,10 @@ elanspi_calibrate_hv_handler (FpiSsm *ssm, FpDevice *dev)
+       if (self->hv_data.gdac_step == 0)
+         {
+           fp_dbg ("<calibhv> calibration ok (step = 0 w/ best_gdac=%04x)", self->hv_data.best_gdac);
++          /* On an empty eFSA80SC this has not been observed; it happens
++           * when a finger rests on the sensor during calibration. */
++          self->calib_converged = FALSE;
++          self->calib_gdac = self->hv_data.best_gdac;
+           /* exit, using best value */
+           fpi_ssm_jump_to_state (ssm, ELANSPI_CALIBHV_WRITE_BEST_GDAC_H);
+           return;
+@@ -914,6 +980,8 @@ elanspi_calibrate_hv_handler (FpiSsm *ssm, FpDevice *dev)
+     }
+ }
+ 
++static gboolean elanspi_press_bg_is_empty (FpiDeviceElanSpi *self);
++
+ static void
+ elanspi_init_ssm_handler (FpiSsm *ssm, FpDevice *dev)
+ {
+@@ -921,6 +989,7 @@ elanspi_init_ssm_handler (FpiSsm *ssm, FpDevice *dev)
+   FpiSpiTransfer *xfer = NULL;
+   GError *err  = NULL;
+   FpiSsm *chld = NULL;
++  gboolean bg_empty;
+ 
+   switch (fpi_ssm_get_cur_state (ssm))
+     {
+@@ -994,9 +1063,13 @@ do_sw_reset:
+       g_clear_pointer (&self->bg_image, g_free);
+       g_clear_pointer (&self->last_image, g_free);
+       g_clear_pointer (&self->prev_frame_image, g_free);
++      g_clear_pointer (&self->press_frames, g_free);
+       self->last_image = g_malloc0 (self->sensor_width * self->sensor_height * 2);
+       self->bg_image = g_malloc0 (self->sensor_width * self->sensor_height * 2);
+       self->prev_frame_image = g_malloc0 (self->sensor_width * self->sensor_height * 2);
++      if (self->press_mode)
++        self->press_frames = g_malloc0_n (ELANSPI_PRESS_SAMPLE_FRAMES * self->sensor_width * self->sensor_height,
++                                          sizeof (guint16));
+       /* reset again */
+       goto do_sw_reset;
+ 
+@@ -1117,7 +1190,12 @@ do_sw_reset:
+       return;
+ 
+     case ELANSPI_INIT_CALIBRATE:
+-      fp_dbg ("<init/calibrate> starting calibrate");
++      /* press mode: libfprint re-activates the device between steps, often
++       * with the finger still down; reuse a recent good calibration then */
++      self->calib_reuse = self->sensor_id == 0xe && self->press_mode && self->good_bg &&
++                          self->calib_retries == 0 &&
++                          g_get_monotonic_time () - self->good_bg_time < ELANSPI_PRESS_CALIB_REUSE_USEC;
++      fp_dbg ("<init/calibrate> starting calibrate%s", self->calib_reuse ? " (reuse)" : "");
+       /* if sensor is hv */
+       if (self->sensor_id == 0xe)
+         chld = fpi_ssm_new_full (dev, elanspi_calibrate_hv_handler, ELANSPI_CALIBHV_NSTATES, ELANSPI_CALIBHV_PROTECT, "HV calibrate");
+@@ -1137,7 +1215,42 @@ do_sw_reset:
+       return;
+ 
+     case ELANSPI_INIT_BG_SAVE:
++      bg_empty = !self->press_mode || elanspi_press_bg_is_empty (self);
++      if (!bg_empty && self->calib_reuse)
++        {
++          fp_dbg ("<init/bg> finger on sensor, keeping previous background");
++          memcpy (self->last_image, self->good_bg, self->sensor_height * self->sensor_width * 2);
++        }
++      else if (!bg_empty)
++        {
++          if (self->calib_retries < ELANSPI_PRESS_CALIB_RETRIES)
++            {
++              self->calib_retries += 1;
++              fp_dbg ("<init/bg> sensor not empty (finger still down?), recalibrating (%u/%d)",
++                      self->calib_retries, ELANSPI_PRESS_CALIB_RETRIES);
++              fpi_ssm_jump_to_state_delayed (ssm, ELANSPI_INIT_CALIBRATE, ELANSPI_PRESS_CALIB_RETRY_MS);
++              return;
++            }
++          if (self->good_bg && self->calib_gdac == self->good_gdac)
++            {
++              fp_warn ("<init/bg> sensor never looked empty; reusing previous background");
++              memcpy (self->last_image, self->good_bg, self->sensor_height * self->sensor_width * 2);
++            }
++          else
++            {
++              fp_warn ("<init/bg> sensor never looked empty; background may be wrong");
++            }
++        }
++      self->calib_retries = 0;
+       memcpy (self->bg_image, self->last_image, self->sensor_height * self->sensor_width * 2);
++      if (self->press_mode && bg_empty)
++        {
++          if (!self->good_bg)
++            self->good_bg = g_malloc_n (self->sensor_height * self->sensor_width, sizeof (guint16));
++          memcpy (self->good_bg, self->bg_image, self->sensor_height * self->sensor_width * 2);
++          self->good_gdac = self->calib_gdac;
++          self->good_bg_time = g_get_monotonic_time ();
++        }
+       fpi_ssm_mark_completed (ssm);
+       return;
+     }
+@@ -1209,6 +1322,10 @@ elanspi_guess_image (FpiDeviceElanSpi *self, guint16 *raw_image)
+   memcpy (image_copy, raw_image, self->sensor_height * self->sensor_width * 2);
+ 
+   gint invalid_percent = (100 * elanspi_correct_with_bg (self, image_copy)) / (self->sensor_height * self->sensor_width);
++  /* This 3104 sensor reports 40-63% invalid pixels during partial contact,
++   * despite strong fingerprint variance. Keep the original limit elsewhere. */
++  gint max_real_invalid_percent =
++    (fpi_device_get_driver_data (FP_DEVICE (self)) & ELANSPI_RELAXED_FINGER_DETECTION) ? 65 : ELANSPI_MAX_REAL_INVALID_PERCENT;
+   gint is_fp = 0, is_empty = 0;
+ 
+   gint64 mean = 0;
+@@ -1229,7 +1346,7 @@ elanspi_guess_image (FpiDeviceElanSpi *self, guint16 *raw_image)
+ 
+   sq_stddev /= (frame_width * frame_height);
+ 
+-  if (invalid_percent < ELANSPI_MAX_REAL_INVALID_PERCENT)
++  if (invalid_percent < max_real_invalid_percent)
+     is_fp += 1;
+   if (invalid_percent > ELANSPI_MIN_EMPTY_INVALID_PERCENT)
+     is_empty += 1;
+@@ -1239,6 +1356,9 @@ elanspi_guess_image (FpiDeviceElanSpi *self, guint16 *raw_image)
+   if (sq_stddev < ELANSPI_MAX_EMPTY_STDDEV)
+     is_empty += 1;
+ 
++  self->last_guess_sq_stddev = sq_stddev;
++  self->last_guess_invalid_percent = invalid_percent;
++
+   fp_dbg ("<guess> stddev=%" G_GUINT64_FORMAT "d, ip=%d, is_fp=%d, is_empty=%d", sq_stddev, invalid_percent, is_fp, is_empty);
+ 
+   if (is_fp > is_empty)
+@@ -1249,6 +1369,31 @@ elanspi_guess_image (FpiDeviceElanSpi *self, guint16 *raw_image)
+     return ELANSPI_GUESS_UNKNOWN;
+ }
+ 
++/*
++ * Press mode: decide whether the freshly calibrated background (in
++ * last_image) was taken on an empty sensor. A finger during calibration makes
++ * the gain search fail to converge; if it did converge, compare against the
++ * last background known to be empty, which is only meaningful at equal gain.
++ */
++static gboolean
++elanspi_press_bg_is_empty (FpiDeviceElanSpi *self)
++{
++  enum elanspi_guess_result guess;
++  guint16 *saved_bg;
++
++  if (!self->calib_converged)
++    return FALSE;
++  if (!self->good_bg || self->calib_gdac != self->good_gdac)
++    return TRUE;
++
++  saved_bg = self->bg_image;
++  self->bg_image = self->good_bg;
++  guess = elanspi_guess_image (self, self->last_image);
++  self->bg_image = saved_bg;
++
++  return guess == ELANSPI_GUESS_EMPTY;
++}
++
+ /* returns TRUE when the waiting is complete */
+ static gboolean
+ elanspi_check_waitupdown_done (FpiDeviceElanSpi *self, enum elanspi_guess_result target)
+@@ -1329,11 +1474,52 @@ elanspi_fp_assembling_get_pixel (struct fpi_frame_asmbl_ctx *ctx, struct fpi_fra
+   return frame->data[y * ctx->frame_width + x];
+ }
+ 
++/* Separable gaussian smoothing pass (sigma ~1.2, radius 3). Suppresses
++ * sensor-noise speckle that otherwise produces spurious, non-repeatable
++ * image features on the eFSA80SC. */
++static void
++elanspi_smooth_image (FpImage *img)
++{
++  /* gaussian kernel, sigma=1.2 */
++  static const guint kern[7] = { 34, 111, 218, 298, 218, 111, 34 };
++  guint w = img->width, h = img->height;
++  g_autofree guint8 *tmp = g_malloc (w * h);
++  guint8 *data = (guint8 *) img->data;
++
++  for (guint y = 0; y < h; y++)
++    for (guint x = 0; x < w; x++)
++      {
++        guint acc = 0, wsum = 0;
++        for (gint k = -3; k <= 3; k++)
++          {
++            gint xx = (gint) x + k;
++            if (xx < 0 || xx >= (gint) w)
++              continue;
++            acc += kern[k + 3] * data[y * w + xx];
++            wsum += kern[k + 3];
++          }
++        tmp[y * w + x] = acc / wsum;
++      }
++  for (guint y = 0; y < h; y++)
++    for (guint x = 0; x < w; x++)
++      {
++        guint acc = 0, wsum = 0;
++        for (gint k = -3; k <= 3; k++)
++          {
++            gint yy = (gint) y + k;
++            if (yy < 0 || yy >= (gint) h)
++              continue;
++            acc += kern[k + 3] * tmp[yy * w + x];
++            wsum += kern[k + 3];
++          }
++        data[y * w + x] = acc / wsum;
++      }
++}
++
+ static void
+ elanspi_fp_frame_stitch_and_submit (FpiDeviceElanSpi *self)
+ {
+   g_autoptr(FpImage) img = NULL;
+-  g_autoptr(FpImage) scaled = NULL;
+   struct fpi_frame_asmbl_ctx assembling_ctx = {
+     .image_width = (self->frame_width * 3) / 2,
+ 
+@@ -1348,12 +1534,17 @@ elanspi_fp_frame_stitch_and_submit (FpiDeviceElanSpi *self)
+ 
+   fpi_do_movement_estimation (&assembling_ctx, frame_start);
+   img = fpi_assemble_frames (&assembling_ctx, frame_start);
+-  scaled = fpi_image_resize (img, 2, 2);
+ 
+-  scaled->flags |= FPI_IMAGE_PARTIAL | FPI_IMAGE_COLORS_INVERTED;
++  /* The assembled image is used at native scale: its ~10px ridge period is
++   * already in the matcher's expected band, and a 2x upscale only starves
++   * feature extraction. FPI_IMAGE_PARTIAL is not set since on these narrow
++   * strips it would cull most minutiae as perimeter points. Light smoothing
++   * suppresses sensor noise that otherwise creates spurious features. */
++  elanspi_smooth_image (img);
++  img->flags |= FPI_IMAGE_COLORS_INVERTED;
+ 
+   /* submit image */
+-  fpi_image_device_image_captured (FP_IMAGE_DEVICE (self), g_steal_pointer (&scaled));
++  fpi_image_device_image_captured (FP_IMAGE_DEVICE (self), g_steal_pointer (&img));
+ 
+   /* clean out frame data */
+   g_slist_free_full (g_steal_pointer (&self->fp_frame_list), g_free);
+@@ -1471,6 +1662,173 @@ finish_capture:
+ 
+ }
+ 
++/*
++ * Press (place-and-hold) capture for square area sensors.
++ *
++ * The swipe path discards frames that do not differ from the previous one, so
++ * a stationary finger never yields enough frames and every touch is reported
++ * as a short swipe. Here, once the finger is down, a few frames that fully
++ * cover the sensor are collected; the sharpest one (highest variance) is
++ * chosen, averaged with any other frames that are near-identical to it (the
++ * finger did not move, so this only reduces sensor noise), and submitted as a
++ * single full-size image.
++ */
++/* Debug aid for offline tuning: when ELANSPI_DUMP_FILE is set in the
++ * environment of the process using libfprint (never set for fprintd), write
++ * the collected press frames there. Format: "ELP1", u16 width, u16 height,
++ * u16 count, u16 best, count * i64 quality, count * width*height u16
++ * background-corrected frames in sensor (unrotated) layout. */
++static void
++elanspi_press_dump (FpiDeviceElanSpi *self, guint best)
++{
++  const gchar *path = g_getenv ("ELANSPI_DUMP_FILE");
++  gsize npix = (gsize) self->sensor_width * self->sensor_height;
++  guint16 hdr[4] = { self->sensor_width, self->sensor_height, self->press_count, best };
++  FILE *f;
++
++  if (!path || !*path)
++    return;
++  f = fopen (path, "wb");
++  if (!f)
++    {
++      fp_warn ("<press> cannot write dump %s", path);
++      return;
++    }
++  fwrite ("ELP1", 1, 4, f);
++  fwrite (hdr, sizeof (guint16), 4, f);
++  fwrite (self->press_quality, sizeof (gint64), self->press_count, f);
++  fwrite (self->press_frames, sizeof (guint16), npix * self->press_count, f);
++  fclose (f);
++  fp_dbg ("<press> dumped %u frames to %s", self->press_count, path);
++}
++
++static void
++elanspi_press_submit (FpiDeviceElanSpi *self)
++{
++  g_autoptr(FpImage) img = NULL;
++  gsize npix = (gsize) self->sensor_width * self->sensor_height;
++  g_autofree guint32 *acc = g_malloc0_n (npix, sizeof (guint32));
++  g_autofree guint16 *avg = g_malloc_n (npix, sizeof (guint16));
++  guint16 *best_frame;
++  guint best = 0, used = 0;
++
++  g_assert (self->press_count > 0);
++
++  for (guint i = 1; i < self->press_count; i += 1)
++    if (self->press_quality[i] > self->press_quality[best])
++      best = i;
++  best_frame = self->press_frames + best * npix;
++  elanspi_press_dump (self, best);
++
++  for (guint i = 0; i < self->press_count; i += 1)
++    {
++      guint16 *frame = self->press_frames + i * npix;
++
++      if (i != best)
++        {
++          gint64 diff = elanspi_get_frame_diff_stddev_sq (self, best_frame, frame);
++          if (diff >= ELANSPI_PRESS_MAX_AVERAGE_DIFF)
++            {
++              fp_dbg ("<press> frame %u moved (diff %" G_GINT64_FORMAT "), not averaged", i, diff);
++              continue;
++            }
++        }
++      for (gsize p = 0; p < npix; p += 1)
++        acc[p] += frame[p];
++      used += 1;
++    }
++
++  for (gsize p = 0; p < npix; p += 1)
++    avg[p] = acc[p] / used;
++
++  fp_dbg ("<press> submitting %ux%u image: best frame %u (stddev %" G_GINT64_FORMAT "), %u/%u frames averaged",
++          self->frame_width, self->frame_height, best, self->press_quality[best], used, self->press_count);
++
++  img = fp_image_new (self->frame_width, self->frame_height);
++  elanspi_process_frame (self, avg, img->data);
++  /* No smoothing here, unlike the stitched swipe image: frame averaging
++   * already suppresses sensor noise, and on 40 recorded press captures
++   * smoothing cut SIGFM keypoints from ~99 to ~60 and raised genuine
++   * rejections (10-image template, threshold 100) from 0.4% to 3.2%, while
++   * impostor scores stayed <= 8. */
++  img->flags |= FPI_IMAGE_COLORS_INVERTED;
++
++  fpi_image_device_image_captured (FP_IMAGE_DEVICE (self), g_steal_pointer (&img));
++}
++
++static void
++elanspi_press_frame_handler (FpiSsm *ssm, FpiDeviceElanSpi *self)
++{
++  enum elanspi_guess_result guess = elanspi_guess_image (self, self->last_image);
++  gsize npix = (gsize) self->sensor_width * self->sensor_height;
++
++  if (guess == ELANSPI_GUESS_EMPTY)
++    {
++      self->fp_empty_counter += 1;
++      if (self->fp_empty_counter < ELANSPI_MIN_FRAMES_DEBOUNCE)
++        goto next_frame;
++
++      if (self->press_count >= ELANSPI_PRESS_MIN_FRAMES)
++        {
++          fp_dbg ("<press> finger lifted, using %u frames", self->press_count);
++          elanspi_press_submit (self);
++        }
++      else
++        {
++          fp_dbg ("<press> finger lifted before a stable frame (%u)", self->press_count);
++          fpi_image_device_retry_scan (FP_IMAGE_DEVICE (self), FP_DEVICE_RETRY_REMOVE_FINGER);
++        }
++      goto finish_capture;
++    }
++
++  self->fp_empty_counter = 0;
++
++  if (guess == ELANSPI_GUESS_FINGERPRINT &&
++      self->last_guess_invalid_percent <= ELANSPI_PRESS_MAX_INVALID_PERCENT)
++    {
++      guint16 *slot = self->press_frames + self->press_count * npix;
++
++      memcpy (slot, self->last_image, npix * sizeof (guint16));
++      elanspi_correct_with_bg (self, slot);
++      self->press_quality[self->press_count] = self->last_guess_sq_stddev;
++      self->press_count += 1;
++
++      if (self->press_count == ELANSPI_PRESS_SAMPLE_FRAMES)
++        {
++          elanspi_press_submit (self);
++          goto finish_capture;
++        }
++    }
++  else
++    {
++      /* partial contact while the finger settles, or an ambiguous frame */
++      self->press_settle += 1;
++      if (self->press_settle > ELANSPI_PRESS_MAX_SETTLE_FRAMES)
++        {
++          if (self->press_count >= ELANSPI_PRESS_MIN_FRAMES)
++            {
++              elanspi_press_submit (self);
++            }
++          else
++            {
++              fp_dbg ("<press> finger never covered the sensor");
++              fpi_image_device_retry_scan (FP_IMAGE_DEVICE (self), FP_DEVICE_RETRY_CENTER_FINGER);
++            }
++          goto finish_capture;
++        }
++    }
++
++next_frame:
++  fpi_ssm_jump_to_state_delayed (ssm, ELANSPI_FPCAPT_FP_CAPTURE, ELANSPI_HV_SENSOR_FRAME_DELAY);
++  return;
++
++finish_capture:
++  self->press_count = 0;
++  self->press_settle = 0;
++  self->finger_wait_debounce = 0;
++  fpi_ssm_jump_to_state (ssm, ELANSPI_FPCAPT_WAITUP_CAPTURE);
++}
++
+ static void
+ elanspi_fp_capture_ssm_handler (FpiSsm *ssm, FpDevice *dev)
+ {
+@@ -1513,8 +1871,11 @@ elanspi_fp_capture_ssm_handler (FpiSsm *ssm, FpDevice *dev)
+     case ELANSPI_FPCAPT_WAITDOWN_PROCESS:
+       if (!elanspi_check_waitupdown_done (self, ELANSPI_GUESS_FINGERPRINT))
+         {
+-          /* take another image */
+-          fpi_ssm_jump_to_state (ssm, ELANSPI_FPCAPT_WAITDOWN_CAPTURE);
++          /* take another image; press mode polls gently while idle */
++          if (self->press_mode)
++            fpi_ssm_jump_to_state_delayed (ssm, ELANSPI_FPCAPT_WAITDOWN_CAPTURE, ELANSPI_PRESS_IDLE_POLL_MS);
++          else
++            fpi_ssm_jump_to_state (ssm, ELANSPI_FPCAPT_WAITDOWN_CAPTURE);
+           return;
+         }
+ 
+@@ -1522,6 +1883,8 @@ elanspi_fp_capture_ssm_handler (FpiSsm *ssm, FpDevice *dev)
+       self->finger_wait_debounce = 0;
+       g_slist_free_full (g_steal_pointer (&self->fp_frame_list), g_free);
+       self->fp_empty_counter = 0;
++      self->press_count = 0;
++      self->press_settle = 0;
+ 
+       /* report finger status */
+       fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (self), TRUE);
+@@ -1531,14 +1894,20 @@ elanspi_fp_capture_ssm_handler (FpiSsm *ssm, FpDevice *dev)
+       return;
+ 
+     case ELANSPI_FPCAPT_FP_PROCESS:
+-      elanspi_fp_frame_handler (ssm, self);
++      if (self->press_mode)
++        elanspi_press_frame_handler (ssm, self);
++      else
++        elanspi_fp_frame_handler (ssm, self);
+       return;
+ 
+     case ELANSPI_FPCAPT_WAITUP_PROCESS:
+       if (!elanspi_check_waitupdown_done (self, ELANSPI_GUESS_EMPTY))
+         {
+           /* take another image */
+-          fpi_ssm_jump_to_state (ssm, ELANSPI_FPCAPT_WAITUP_CAPTURE);
++          if (self->press_mode)
++            fpi_ssm_jump_to_state_delayed (ssm, ELANSPI_FPCAPT_WAITUP_CAPTURE, ELANSPI_PRESS_IDLE_POLL_MS);
++          else
++            fpi_ssm_jump_to_state (ssm, ELANSPI_FPCAPT_WAITUP_CAPTURE);
+           return;
+         }
+ 
+@@ -1553,6 +1922,21 @@ elanspi_fp_capture_ssm_handler (FpiSsm *ssm, FpDevice *dev)
+     }
+ }
+ 
++/* The sensor is only identified during activation, but fprintd reads the
++ * scan type and enroll stage count long before that, so advertise press
++ * behaviour from the device table here. elanspi_determine_sensor() reverts
++ * this if the detected sensor turns out not to be square. */
++static void
++elanspi_probe (FpDevice *dev)
++{
++  if (fpi_device_get_driver_data (dev) & ELANSPI_PRESS_MODE)
++    {
++      fpi_device_set_scan_type (dev, FP_SCAN_TYPE_PRESS);
++      fpi_device_set_nr_enroll_stages (dev, ELANSPI_PRESS_ENROLL_STAGES);
++    }
++  fpi_device_probe_complete (dev, NULL, NULL, NULL);
++}
++
+ static void
+ elanspi_open (FpImageDevice *dev)
+ {
+@@ -1602,6 +1986,8 @@ elanspi_activate (FpImageDevice *dev)
+ {
+   FpiSsm *ssm = fpi_ssm_new (FP_DEVICE (dev), elanspi_init_ssm_handler, ELANSPI_INIT_NSTATES);
+ 
++  FPI_DEVICE_ELANSPI (dev)->calib_retries = 0;
++
+   fpi_ssm_start (ssm, elanspi_init_finish);
+ }
+ 
+@@ -1627,6 +2013,18 @@ elanspi_fp_capture_finish (FpiSsm *ssm, FpDevice *dev, GError *error)
+   FpImageDevice *idev = FP_IMAGE_DEVICE (dev);
+   FpiDeviceElanSpi *self = FPI_DEVICE_ELANSPI (dev);
+ 
++  /* In enroll, WAITUP_PROCESS reports finger off before completing, which
++   * starts the next capturer first. Don't let the old one clear the new
++   * one's state, or deactivate completes while it is still using the fd. */
++  if (ssm != self->capture_ssm)
++    {
++      fp_dbg ("<capture> stale capturer finished");
++      if (error)
++        g_error_free (error);
++      return;
++    }
++
++  self->capture_ssm = NULL;
+   self->capturing = FALSE;
+ 
+   if (self->deactivating)
+@@ -1655,10 +2053,10 @@ elanspi_change_state (FpImageDevice *dev, FpiImageDeviceState state)
+ 
+       /* start capturer */
+       self->capturing = TRUE;
+-      fpi_ssm_start (fpi_ssm_new (FP_DEVICE (dev),
+-                                  elanspi_fp_capture_ssm_handler,
+-                                  ELANSPI_FPCAPT_NSTATES),
+-                     elanspi_fp_capture_finish);
++      self->capture_ssm = fpi_ssm_new (FP_DEVICE (dev),
++                                       elanspi_fp_capture_ssm_handler,
++                                       ELANSPI_FPCAPT_NSTATES);
++      fpi_ssm_start (self->capture_ssm, elanspi_fp_capture_finish);
+ 
+       fp_dbg ("<change_state> started capturer");
+     }
+@@ -1683,6 +2081,8 @@ fpi_device_elanspi_finalize (GObject *this)
+   g_clear_pointer (&self->bg_image, g_free);
+   g_clear_pointer (&self->last_image, g_free);
+   g_clear_pointer (&self->prev_frame_image, g_free);
++  g_clear_pointer (&self->press_frames, g_free);
++  g_clear_pointer (&self->good_bg, g_free);
+   g_slist_free_full (g_steal_pointer (&self->fp_frame_list), g_free);
+ 
+   G_OBJECT_CLASS (fpi_device_elanspi_parent_class)->finalize (this);
+@@ -1698,10 +2098,17 @@ fpi_device_elanspi_class_init (FpiDeviceElanSpiClass *klass)
+   dev_class->full_name = "ElanTech Embedded Fingerprint Sensor";
+   dev_class->type = FP_DEVICE_TYPE_UDEV;
+   dev_class->id_table = elanspi_id_table;
+-  dev_class->scan_type = FP_SCAN_TYPE_SWIPE;
++  dev_class->scan_type = FP_SCAN_TYPE_SWIPE;   /* per-device override in elanspi_probe */
++  dev_class->probe = elanspi_probe;
+   dev_class->nr_enroll_stages = 7;       /* these sensors are very hit or miss, may as well record a few extras */
+ 
+-  img_class->bz3_threshold = 24;
++  /* SIGFM (SIFT-based) matching: NBIS/bozorth3 cannot discriminate fingers
++   * on the narrow stitched strips these sensors produce (measured genuine
++   * and impostor score distributions fully overlap). SIGFM separates them
++   * by ~3 orders of magnitude. Threshold chosen from a measured corpus:
++   * impostor pairs scored <= 26, genuine pairs typically 10^3..10^7. */
++  img_class->algorithm = FPI_DEVICE_ALGO_SIGFM;
++  img_class->bz3_threshold = 100;
+   img_class->img_open = elanspi_open;
+   img_class->activate = elanspi_activate;
+   img_class->deactivate = elanspi_deactivate;
+diff --git a/libfprint/drivers/elanspi.h b/libfprint/drivers/elanspi.h
+index a8d7319..e243b23 100644
+--- a/libfprint/drivers/elanspi.h
++++ b/libfprint/drivers/elanspi.h
+@@ -334,6 +334,11 @@ static const struct elanspi_regtable elanspi_calibration_table_new_page1 = {
+ #define ELANSPI_90RIGHT_ROTATE 3
+ 
+ #define ELANSPI_HV_FLIPPED 1
++#define ELANSPI_RELAXED_FINGER_DETECTION 4
++/* Square area sensor used as place-and-hold (press) sensor: capture one full
++ * stationary frame instead of stitching a swipe. Only honoured when the
++ * detected sensor is square; otherwise the swipe path is used. */
++#define ELANSPI_PRESS_MODE 8
+ 
+ #define ELANSPI_UDEV_TYPES FPI_DEVICE_UDEV_SUBTYPE_SPIDEV | FPI_DEVICE_UDEV_SUBTYPE_HIDRAW
+ #define ELANSPI_TP_VID 0x04f3
+@@ -341,6 +346,7 @@ static const struct elanspi_regtable elanspi_calibration_table_new_page1 = {
+ // using checkargs ACPI:HIDPID
+ static const FpIdEntry elanspi_id_table[] = {
+   {.udev_types = ELANSPI_UDEV_TYPES, .spi_acpi_id = "ELAN7001", .hid_id = {.vid = ELANSPI_TP_VID, .pid = 0x3057}, .driver_data = ELANSPI_180_ROTATE},
++  {.udev_types = ELANSPI_UDEV_TYPES, .spi_acpi_id = "ELAN7001", .hid_id = {.vid = ELANSPI_TP_VID, .pid = 0x3104}, .driver_data = ELANSPI_90RIGHT_ROTATE | ELANSPI_RELAXED_FINGER_DETECTION | ELANSPI_PRESS_MODE},
+   {.udev_types = ELANSPI_UDEV_TYPES, .spi_acpi_id = "ELAN7001", .hid_id = {.vid = ELANSPI_TP_VID, .pid = 0x3087}, .driver_data = ELANSPI_180_ROTATE},
+   {.udev_types = ELANSPI_UDEV_TYPES, .spi_acpi_id = "ELAN7001", .hid_id = {.vid = ELANSPI_TP_VID, .pid = 0x30c6}, .driver_data = ELANSPI_180_ROTATE},
+   {.udev_types = ELANSPI_UDEV_TYPES, .spi_acpi_id = "ELAN70A1", .hid_id = {.vid = ELANSPI_TP_VID, .pid = 0x3134}, .driver_data = ELANSPI_90LEFT_ROTATE},
+@@ -376,6 +382,20 @@ static const FpIdEntry elanspi_id_table[] = {
+ 
+ #define ELANSPI_HV_SENSOR_FRAME_DELAY 23
+ 
++/* Press mode (see ELANSPI_PRESS_MODE). Measured on eFSA80SC: a held finger
++ * gives clean full-coverage frames (0% invalid pixels, sq. stddev 1.5M-2.8M)
++ * whose frame-to-frame sq. diff stays ~8k-60k while still. */
++#define ELANSPI_PRESS_SAMPLE_FRAMES 4         /* good frames collected per touch */
++#define ELANSPI_PRESS_MIN_FRAMES 2            /* accept fewer if finger lifts early */
++#define ELANSPI_PRESS_MAX_SETTLE_FRAMES 25    /* non-usable frames before giving up */
++#define ELANSPI_PRESS_MAX_INVALID_PERCENT 3   /* usable frame must cover the sensor */
++#define ELANSPI_PRESS_MAX_AVERAGE_DIFF (250 * 250) /* frames this similar are averaged */
++#define ELANSPI_PRESS_IDLE_POLL_MS 30         /* poll interval while waiting for touch/lift */
++#define ELANSPI_PRESS_ENROLL_STAGES 15        /* ~4x4 mm area: more touches for coverage */
++#define ELANSPI_PRESS_CALIB_RETRIES 15        /* re-calibrate while a finger is still down */
++#define ELANSPI_PRESS_CALIB_RETRY_MS 200      /* (each attempt also takes ~0.5 s itself) */
++#define ELANSPI_PRESS_CALIB_REUSE_USEC (5 * 60 * G_USEC_PER_SEC) /* max age of reused calibration */
++
+ #define ELANSPI_OTP_TIMEOUT_USEC (12 * 1000)
+ 
+ #define ELANSPI_OLD_CAPTURE_TIMEOUT_USEC (100 * 1000)
+diff --git a/libfprint/fp-image.c b/libfprint/fp-image.c
+index 2303f6a..be9622d 100644
+--- a/libfprint/fp-image.c
++++ b/libfprint/fp-image.c
+@@ -314,7 +314,9 @@ fp_image_sigfm_extract_thread_func (GTask * task, void * src_obj,
+ 
+   data->sigfm_info = sigfm_extract (data->image, data->width, data->height);
+   g_timer_stop (timer);
+-  fp_dbg ("sigfm extract completed in %f secs", g_timer_elapsed (timer, NULL));
++  fp_dbg ("sigfm extract completed in %f secs, %dx%d image, %d keypoints",
++          g_timer_elapsed (timer, NULL), data->width, data->height,
++          sigfm_keypoints_count (data->sigfm_info));
+   g_timer_destroy (timer);
+   if (sigfm_keypoints_count (data->sigfm_info) < 25)
+     {
+diff --git a/libfprint/fp-print.c b/libfprint/fp-print.c
+index cf1f7df..6871019 100644
+--- a/libfprint/fp-print.c
++++ b/libfprint/fp-print.c
+@@ -681,7 +681,7 @@ fp_print_serialize (FpPrint *print,
+   g_variant_builder_open (&builder, G_VARIANT_TYPE_VARDICT);
+   g_variant_builder_close (&builder);
+ 
+-  GPtrArray * to_free = g_ptr_array_new ();
++  g_autoptr(GPtrArray) to_free = g_ptr_array_new_with_free_func (g_free);
+ 
+   /* Insert NBIS print data for type NBIS, otherwise the GVariant directly */
+   if (print->type == FPI_PRINT_NBIS)
+@@ -765,8 +765,6 @@ fp_print_serialize (FpPrint *print,
+ 
+   g_variant_get_data (result);
+   g_variant_store (result, (*data) + 3);
+-  g_clear_object (&to_free);
+-
+   return TRUE;
+ }
+ 
+@@ -916,6 +914,8 @@ fp_print_deserialize (const guchar *data,
+             g_variant_get_fixed_array (child, &slen, sizeof (unsigned char));
+           g_variant_unref (child);
+ 
++          if (slen > G_MAXINT)
++            goto invalid_format;
+           SigfmImgInfo * sigfm_info = sigfm_deserialize_binary (serialized, slen);
+           if (!sigfm_info)
+             goto invalid_format;
+diff --git a/libfprint/fpi-image-device.c b/libfprint/fpi-image-device.c
+index 57924df..915fa3c 100644
+--- a/libfprint/fpi-image-device.c
++++ b/libfprint/fpi-image-device.c
+@@ -320,7 +320,7 @@ fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, g
+   else if (action == FPI_DEVICE_ACTION_VERIFY)
+     {
+       FpPrint *template;
+-      FpiMatchResult result;
++      FpiMatchResult result = FPI_MATCH_ERROR;
+ 
+       fpi_device_get_verify_data (device, &template);
+       if (print)
+diff --git a/libfprint/sigfm/binary.hpp b/libfprint/sigfm/binary.hpp
+index da9c740..2a32bb4 100644
+--- a/libfprint/sigfm/binary.hpp
++++ b/libfprint/sigfm/binary.hpp
+@@ -111,6 +111,9 @@ public:
+                          bool> = true>
+     constexpr stream& read(Iter&& begin, std::size_t dist)
+     {
++        if (dist > store_.size()) {
++            throw std::runtime_error{"tried to extract from too small stream"};
++        }
+         std::copy(store_.begin(), store_.begin() + dist, begin);
+         store_.erase(store_.begin(), store_.begin() + dist);
+         return *this;
+@@ -142,6 +145,12 @@ struct deserializer<cv::Mat> : public std::true_type {
+     {
+         int rows, cols, type;
+         in >> type >> rows >> cols;
++        if (rows < 0 || cols < 0 || type < 0 || type > CV_MAT_TYPE_MASK ||
++            ((rows == 0 || cols == 0) && (rows != 0 || cols != 0)) ||
++            (rows != 0 && static_cast<std::size_t>(rows) >
++                              in.size() / (static_cast<std::size_t>(cols) * CV_ELEM_SIZE(type)))) {
++            throw std::runtime_error{"invalid descriptor matrix"};
++        }
+         cv::Mat m;
+         m.create(rows, cols, type);
+         in.read(m.data, std::distance(m.datastart, m.dataend));
+@@ -202,6 +211,9 @@ struct deserializer<std::vector<T>> : public std::true_type {
+     {
+         std::size_t size;
+         in >> size;
++        if (size > in.size()) {
++            throw std::runtime_error{"invalid vector length"};
++        }
+         std::vector<T> vs;
+         vs.reserve(size);
+         for (std::size_t n = 0; n != size; ++n) {
+diff --git a/libfprint/sigfm/sigfm.cpp b/libfprint/sigfm/sigfm.cpp
+index 0781299..4fc1dce 100644
+--- a/libfprint/sigfm/sigfm.cpp
++++ b/libfprint/sigfm/sigfm.cpp
+@@ -76,7 +76,7 @@ struct match {
+     bool operator<(const match& right) const
+     {
+         return (this->p1.y < right.p1.y) ||
+-               ((this->p1.y < right.p1.y) && this->p1.x < right.p1.x);
++               ((this->p1.y == right.p1.y) && this->p1.x < right.p1.x);
+     }
+ };
+ struct angle {
+@@ -103,6 +103,9 @@ unsigned char* sigfm_serialize_binary(SigfmImgInfo* info, int* outlen)
+ 
+ SigfmImgInfo* sigfm_deserialize_binary(const unsigned char* bytes, int len)
+ {
++    if (len < 0 || bytes == nullptr) {
++        return nullptr;
++    }
+     try {
+         bin::stream s{bytes, bytes + len};
+         auto info = std::make_unique<SigfmImgInfo>();
+diff --git a/libfprint/sigfm/tests.cpp b/libfprint/sigfm/tests.cpp
+index 1b7ae2f..2092f28 100644
+--- a/libfprint/sigfm/tests.cpp
++++ b/libfprint/sigfm/tests.cpp
+@@ -91,6 +91,19 @@ TEST_SUITE("binary")
+         CHECK(outputs == inputs);
+     }
+ 
++    TEST_CASE("truncated stored data is rejected")
++    {
++        bin::stream short_bytes;
++        short_bytes << std::size_t{1};
++        std::vector<int> values;
++        CHECK_THROWS(short_bytes >> values);
++
++        bin::stream short_matrix;
++        short_matrix << CV_8UC1 << 256 << 256;
++        cv::Mat output;
++        CHECK_THROWS(short_matrix >> output);
++    }
++
+     TEST_CASE("keypoints can be stored and restored")
+     {
+         cv::KeyPoint pt;
