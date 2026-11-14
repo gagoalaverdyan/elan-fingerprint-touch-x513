@@ -10,7 +10,8 @@ fi
 kit="$(cd "$(dirname "$0")" && pwd)"
 dest=/opt/libfprint-elan/lib64
 
-dnf -y install fprintd fprintd-pam
+# fprintd + the OpenCV runtime libraries the driver links against (SIGFM matcher)
+dnf -y install fprintd fprintd-pam opencv-core opencv-imgproc opencv-features2d opencv-flann
 
 # 1. driver library, loaded only by fprintd (Fedora's libfprint stays untouched)
 mkdir -p "$dest"
