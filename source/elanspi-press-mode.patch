@@ -1,5 +1,5 @@
 diff --git a/libfprint/drivers/elanspi.c b/libfprint/drivers/elanspi.c
-index c2e3cbc2..9d5d4490 100644
+index c2e3cbc2..fe3ff2ef 100644
 --- a/libfprint/drivers/elanspi.c
 +++ b/libfprint/drivers/elanspi.c
 @@ -30,6 +30,7 @@
@@ -91,7 +91,19 @@ index c2e3cbc2..9d5d4490 100644
      {
        self->frame_width = self->sensor_height;
        self->frame_height = self->sensor_width > ELANSPI_MAX_FRAME_HEIGHT ? ELANSPI_MAX_FRAME_HEIGHT : self->sensor_width;
-@@ -803,6 +855,8 @@ elanspi_calibrate_hv_handler (FpiSsm *ssm, FpDevice *dev)
+@@ -781,6 +833,11 @@ elanspi_capture_hv_handler (FpiSsm *ssm, FpDevice *dev)
+       fpi_spi_transfer_write (xfer, 2);
+       xfer->buffer_wr[0] = 0x10;                   /* receieve line */
+       fpi_spi_transfer_read (xfer, self->sensor_height * (self->sensor_width * 2 + 48));
++      /* The LPSS SPI controller keeps a CPU busy for a whole kernel transfer;
++       * a 16.6 KB frame in one piece stalled a core for ~74 ms, enough to make
++       * audio crackle and the touchpad lag. Read it in small pieces. */
++      if (self->press_mode)
++        fpi_spi_transfer_set_max_chunk_size (xfer, ELANSPI_PRESS_SPI_CHUNK);
+       fpi_spi_transfer_submit (xfer, fpi_device_get_cancellable (dev), elanspi_capture_hv_image_handler, NULL);
+       return;
+     }
+@@ -803,6 +860,8 @@ elanspi_calibrate_hv_handler (FpiSsm *ssm, FpDevice *dev)
        self->hv_data.gdac_step  = 0x100;
        self->hv_data.best_gdac  = 0x0;
        self->hv_data.best_meandiff = 0xffff;
@@ -100,7 +112,7 @@ index c2e3cbc2..9d5d4490 100644
  
      case ELANSPI_CALIBHV_SELECT_PAGE0_1:
        xfer = elanspi_do_selectpage (self, 0);
-@@ -873,11 +927,23 @@ elanspi_calibrate_hv_handler (FpiSsm *ssm, FpDevice *dev)
+@@ -873,11 +932,23 @@ elanspi_calibrate_hv_handler (FpiSsm *ssm, FpDevice *dev)
        return;
  
      case ELANSPI_CALIBHV_PROCESS:
@@ -124,7 +136,7 @@ index c2e3cbc2..9d5d4490 100644
            /* exit early, jump right to protect */
            fpi_ssm_jump_to_state (ssm, ELANSPI_CALIBHV_PROTECT);
            return;
-@@ -892,6 +958,10 @@ elanspi_calibrate_hv_handler (FpiSsm *ssm, FpDevice *dev)
+@@ -892,6 +963,10 @@ elanspi_calibrate_hv_handler (FpiSsm *ssm, FpDevice *dev)
        if (self->hv_data.gdac_step == 0)
          {
            fp_dbg ("<calibhv> calibration ok (step = 0 w/ best_gdac=%04x)", self->hv_data.best_gdac);
@@ -135,7 +147,7 @@ index c2e3cbc2..9d5d4490 100644
            /* exit, using best value */
            fpi_ssm_jump_to_state (ssm, ELANSPI_CALIBHV_WRITE_BEST_GDAC_H);
            return;
-@@ -915,6 +985,8 @@ elanspi_calibrate_hv_handler (FpiSsm *ssm, FpDevice *dev)
+@@ -915,6 +990,8 @@ elanspi_calibrate_hv_handler (FpiSsm *ssm, FpDevice *dev)
      }
  }
  
@@ -144,7 +156,7 @@ index c2e3cbc2..9d5d4490 100644
  static void
  elanspi_init_ssm_handler (FpiSsm *ssm, FpDevice *dev)
  {
-@@ -922,6 +994,7 @@ elanspi_init_ssm_handler (FpiSsm *ssm, FpDevice *dev)
+@@ -922,6 +999,7 @@ elanspi_init_ssm_handler (FpiSsm *ssm, FpDevice *dev)
    FpiSpiTransfer *xfer = NULL;
    GError *err  = NULL;
    FpiSsm *chld = NULL;
@@ -152,7 +164,7 @@ index c2e3cbc2..9d5d4490 100644
  
    switch (fpi_ssm_get_cur_state (ssm))
      {
-@@ -995,9 +1068,13 @@ do_sw_reset:
+@@ -995,9 +1073,13 @@ do_sw_reset:
        g_clear_pointer (&self->bg_image, g_free);
        g_clear_pointer (&self->last_image, g_free);
        g_clear_pointer (&self->prev_frame_image, g_free);
@@ -166,7 +178,7 @@ index c2e3cbc2..9d5d4490 100644
        /* reset again */
        goto do_sw_reset;
  
-@@ -1118,7 +1195,12 @@ do_sw_reset:
+@@ -1118,7 +1200,12 @@ do_sw_reset:
        return;
  
      case ELANSPI_INIT_CALIBRATE:
@@ -180,7 +192,7 @@ index c2e3cbc2..9d5d4490 100644
        /* if sensor is hv */
        if (self->sensor_id == 0xe)
          chld = fpi_ssm_new_full (dev, elanspi_calibrate_hv_handler, ELANSPI_CALIBHV_NSTATES, ELANSPI_CALIBHV_PROTECT, "HV calibrate");
-@@ -1138,7 +1220,42 @@ do_sw_reset:
+@@ -1138,7 +1225,42 @@ do_sw_reset:
        return;
  
      case ELANSPI_INIT_BG_SAVE:
@@ -223,7 +235,7 @@ index c2e3cbc2..9d5d4490 100644
        fpi_ssm_mark_completed (ssm);
        return;
      }
-@@ -1210,6 +1327,10 @@ elanspi_guess_image (FpiDeviceElanSpi *self, guint16 *raw_image)
+@@ -1210,6 +1332,10 @@ elanspi_guess_image (FpiDeviceElanSpi *self, guint16 *raw_image)
    memcpy (image_copy, raw_image, self->sensor_height * self->sensor_width * 2);
  
    gint invalid_percent = (100 * elanspi_correct_with_bg (self, image_copy)) / (self->sensor_height * self->sensor_width);
@@ -234,7 +246,7 @@ index c2e3cbc2..9d5d4490 100644
    gint is_fp = 0, is_empty = 0;
  
    gint64 mean = 0;
-@@ -1230,7 +1351,7 @@ elanspi_guess_image (FpiDeviceElanSpi *self, guint16 *raw_image)
+@@ -1230,7 +1356,7 @@ elanspi_guess_image (FpiDeviceElanSpi *self, guint16 *raw_image)
  
    sq_stddev /= (frame_width * frame_height);
  
@@ -243,7 +255,7 @@ index c2e3cbc2..9d5d4490 100644
      is_fp += 1;
    if (invalid_percent > ELANSPI_MIN_EMPTY_INVALID_PERCENT)
      is_empty += 1;
-@@ -1240,14 +1361,44 @@ elanspi_guess_image (FpiDeviceElanSpi *self, guint16 *raw_image)
+@@ -1240,14 +1366,44 @@ elanspi_guess_image (FpiDeviceElanSpi *self, guint16 *raw_image)
    if (sq_stddev < ELANSPI_MAX_EMPTY_STDDEV)
      is_empty += 1;
  
@@ -291,7 +303,7 @@ index c2e3cbc2..9d5d4490 100644
  }
  
  /* returns TRUE when the waiting is complete */
-@@ -1472,6 +1623,228 @@ finish_capture:
+@@ -1472,6 +1628,228 @@ finish_capture:
  
  }
  
@@ -520,7 +532,7 @@ index c2e3cbc2..9d5d4490 100644
  static void
  elanspi_fp_capture_ssm_handler (FpiSsm *ssm, FpDevice *dev)
  {
-@@ -1514,8 +1887,14 @@ elanspi_fp_capture_ssm_handler (FpiSsm *ssm, FpDevice *dev)
+@@ -1514,8 +1892,14 @@ elanspi_fp_capture_ssm_handler (FpiSsm *ssm, FpDevice *dev)
      case ELANSPI_FPCAPT_WAITDOWN_PROCESS:
        if (!elanspi_check_waitupdown_done (self, ELANSPI_GUESS_FINGERPRINT))
          {
@@ -537,7 +549,7 @@ index c2e3cbc2..9d5d4490 100644
            return;
          }
  
-@@ -1523,6 +1902,8 @@ elanspi_fp_capture_ssm_handler (FpiSsm *ssm, FpDevice *dev)
+@@ -1523,6 +1907,8 @@ elanspi_fp_capture_ssm_handler (FpiSsm *ssm, FpDevice *dev)
        self->finger_wait_debounce = 0;
        g_slist_free_full (g_steal_pointer (&self->fp_frame_list), g_free);
        self->fp_empty_counter = 0;
@@ -546,7 +558,7 @@ index c2e3cbc2..9d5d4490 100644
  
        /* report finger status */
        fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (self), TRUE);
-@@ -1532,14 +1913,20 @@ elanspi_fp_capture_ssm_handler (FpiSsm *ssm, FpDevice *dev)
+@@ -1532,14 +1918,20 @@ elanspi_fp_capture_ssm_handler (FpiSsm *ssm, FpDevice *dev)
        return;
  
      case ELANSPI_FPCAPT_FP_PROCESS:
@@ -569,7 +581,7 @@ index c2e3cbc2..9d5d4490 100644
            return;
          }
  
-@@ -1554,6 +1941,26 @@ elanspi_fp_capture_ssm_handler (FpiSsm *ssm, FpDevice *dev)
+@@ -1554,6 +1946,32 @@ elanspi_fp_capture_ssm_handler (FpiSsm *ssm, FpDevice *dev)
      }
  }
  
@@ -589,6 +601,12 @@ index c2e3cbc2..9d5d4490 100644
 +       * <= 8, genuine best-of-template scores typically 10^3..10^5. */
 +      fpi_image_device_set_algorithm (FP_IMAGE_DEVICE (dev), FPI_DEVICE_ALGO_SIGFM);
 +      fpi_image_device_set_bz3_threshold (FP_IMAGE_DEVICE (dev), ELANSPI_PRESS_SIGFM_THRESHOLD);
++      /* libfprint's default treats 3 min of continuous use as overheating
++       * and then blocks the reader. This capacitive sensor barely warms up
++       * (it idles at ~26% duty), and GNOME's lock screen or fingerprint
++       * settings page can keep a verification running for minutes. */
++      fpi_device_set_temperature_limits (dev, ELANSPI_PRESS_TEMP_HOT_SECONDS,
++                                         ELANSPI_PRESS_TEMP_COLD_SECONDS);
 +    }
 +  fpi_device_probe_complete (dev, NULL, NULL, NULL);
 +}
@@ -596,7 +614,7 @@ index c2e3cbc2..9d5d4490 100644
  static void
  elanspi_open (FpImageDevice *dev)
  {
-@@ -1603,6 +2010,9 @@ elanspi_activate (FpImageDevice *dev)
+@@ -1603,6 +2021,9 @@ elanspi_activate (FpImageDevice *dev)
  {
    FpiSsm *ssm = fpi_ssm_new (FP_DEVICE (dev), elanspi_init_ssm_handler, ELANSPI_INIT_NSTATES);
  
@@ -606,7 +624,7 @@ index c2e3cbc2..9d5d4490 100644
    fpi_ssm_start (ssm, elanspi_init_finish);
  }
  
-@@ -1628,6 +2038,18 @@ elanspi_fp_capture_finish (FpiSsm *ssm, FpDevice *dev, GError *error)
+@@ -1628,6 +2049,18 @@ elanspi_fp_capture_finish (FpiSsm *ssm, FpDevice *dev, GError *error)
    FpImageDevice *idev = FP_IMAGE_DEVICE (dev);
    FpiDeviceElanSpi *self = FPI_DEVICE_ELANSPI (dev);
  
@@ -625,7 +643,7 @@ index c2e3cbc2..9d5d4490 100644
    self->capturing = FALSE;
  
    if (self->deactivating)
-@@ -1656,10 +2078,10 @@ elanspi_change_state (FpImageDevice *dev, FpiImageDeviceState state)
+@@ -1656,10 +2089,10 @@ elanspi_change_state (FpImageDevice *dev, FpiImageDeviceState state)
  
        /* start capturer */
        self->capturing = TRUE;
@@ -640,7 +658,7 @@ index c2e3cbc2..9d5d4490 100644
  
        fp_dbg ("<change_state> started capturer");
      }
-@@ -1684,6 +2106,8 @@ fpi_device_elanspi_finalize (GObject *this)
+@@ -1684,6 +2117,8 @@ fpi_device_elanspi_finalize (GObject *this)
    g_clear_pointer (&self->bg_image, g_free);
    g_clear_pointer (&self->last_image, g_free);
    g_clear_pointer (&self->prev_frame_image, g_free);
@@ -649,7 +667,7 @@ index c2e3cbc2..9d5d4490 100644
    g_slist_free_full (g_steal_pointer (&self->fp_frame_list), g_free);
  
    G_OBJECT_CLASS (fpi_device_elanspi_parent_class)->finalize (this);
-@@ -1699,7 +2123,8 @@ fpi_device_elanspi_class_init (FpiDeviceElanSpiClass *klass)
+@@ -1699,7 +2134,8 @@ fpi_device_elanspi_class_init (FpiDeviceElanSpiClass *klass)
    dev_class->full_name = "ElanTech Embedded Fingerprint Sensor";
    dev_class->type = FP_DEVICE_TYPE_UDEV;
    dev_class->id_table = elanspi_id_table;
@@ -660,7 +678,7 @@ index c2e3cbc2..9d5d4490 100644
  
    img_class->bz3_threshold = 24;
 diff --git a/libfprint/drivers/elanspi.h b/libfprint/drivers/elanspi.h
-index 688f4775..10ab5fe1 100644
+index 688f4775..846b8250 100644
 --- a/libfprint/drivers/elanspi.h
 +++ b/libfprint/drivers/elanspi.h
 @@ -334,6 +334,11 @@ static const struct elanspi_regtable elanspi_calibration_table_new_page1 = {
@@ -683,7 +701,7 @@ index 688f4775..10ab5fe1 100644
    {.udev_types = ELANSPI_UDEV_TYPES, .spi_acpi_id = "ELAN7001", .hid_id = {.vid = ELANSPI_TP_VID, .pid = 0x3087}, .driver_data = ELANSPI_180_ROTATE},
    {.udev_types = ELANSPI_UDEV_TYPES, .spi_acpi_id = "ELAN7001", .hid_id = {.vid = ELANSPI_TP_VID, .pid = 0x30c6}, .driver_data = ELANSPI_180_ROTATE},
    {.udev_types = ELANSPI_UDEV_TYPES, .spi_acpi_id = "ELAN7001", .hid_id = {.vid = ELANSPI_TP_VID, .pid = 0x3128}, .driver_data = ELANSPI_90LEFT_ROTATE},
-@@ -378,6 +384,24 @@ static const FpIdEntry elanspi_id_table[] = {
+@@ -378,6 +384,27 @@ static const FpIdEntry elanspi_id_table[] = {
  
  #define ELANSPI_HV_SENSOR_FRAME_DELAY 23
  
@@ -697,7 +715,10 @@ index 688f4775..10ab5fe1 100644
 +#define ELANSPI_PRESS_MAX_AVERAGE_DIFF (250 * 250) /* frames this similar are averaged */
 +#define ELANSPI_PRESS_IDLE_POLL_MS 30         /* poll interval once a finger appears / waiting for lift */
 +#define ELANSPI_PRESS_SLOW_POLL_MS 250        /* poll interval while the sensor is empty */
++#define ELANSPI_PRESS_SPI_CHUNK 512          /* bytes per kernel SPI transfer when reading a frame */
 +#define ELANSPI_PRESS_SIGFM_THRESHOLD 100     /* SIGFM match score threshold */
++#define ELANSPI_PRESS_TEMP_HOT_SECONDS (5 * 60)  /* "hot" after ~5 min continuous use (default 3) */
++#define ELANSPI_PRESS_TEMP_COLD_SECONDS (9 * 60) /* cool-down time constant, libfprint default */
 +#define ELANSPI_PRESS_ENROLL_STAGES 15        /* ~4x4 mm area: more touches for coverage */
 +#define ELANSPI_PRESS_CALIB_RETRIES 15        /* re-calibrate while a finger is still down */
 +#define ELANSPI_PRESS_BAD_BG_INVALID_PERCENT 95 /* empty sensor vs finger-polluted background */
@@ -1049,10 +1070,42 @@ index d541437c..b1e6205f 100644
        {
          g_autoptr(GVariant) fp_data = g_variant_get_child_value (print_data, 0);
 diff --git a/libfprint/fpi-device.c b/libfprint/fpi-device.c
-index 9500b3ac..65e64d17 100644
+index 9500b3ac..4e5a64a3 100644
 --- a/libfprint/fpi-device.c
 +++ b/libfprint/fpi-device.c
-@@ -2169,8 +2169,11 @@ fpi_device_verify_report (FpDevice      *device,
+@@ -374,6 +374,31 @@ fpi_device_set_scan_type (FpDevice  *device,
+   g_object_notify (G_OBJECT (device), "scan-type");
+ }
+ 
++/**
++ * fpi_device_set_temperature_limits:
++ * @device: The #FpDevice
++ * @hot_seconds: Time constant of heating up while active
++ * @cold_seconds: Time constant of cooling down while idle
++ *
++ * Override the class temperature model for this device, e.g. for a driver
++ * whose devices differ in how quickly they warm up. Starting from cold, a
++ * continuously active device is considered hot after about @hot_seconds.
++ * Call it from the probe callback, before the device is used.
++ */
++void
++fpi_device_set_temperature_limits (FpDevice *device,
++                                   gint32    hot_seconds,
++                                   gint32    cold_seconds)
++{
++  FpDevicePrivate *priv = fp_device_get_instance_private (device);
++
++  g_return_if_fail (FP_IS_DEVICE (device));
++  g_return_if_fail (hot_seconds > 0 && cold_seconds > 0);
++
++  priv->temp_hot_seconds = hot_seconds;
++  priv->temp_cold_seconds = cold_seconds;
++}
++
+ /**
+  * fpi_device_update_features:
+  * @device: The #FpDevice
+@@ -2169,8 +2194,11 @@ fpi_device_verify_report (FpDevice      *device,
            fpi_device_get_verify_data (device, &data->match);
            g_object_ref (data->match);
  
@@ -1064,7 +1117,7 @@ index 9500b3ac..65e64d17 100644
                !fp_print_equal (print, data->match))
              {
                g_warning ("Driver reported a match providing a scanned print that is not matching it.");
-@@ -2271,6 +2274,7 @@ fpi_device_identify_report (FpDevice *device,
+@@ -2271,6 +2299,7 @@ fpi_device_identify_report (FpDevice *device,
    else
      {
        if (match && print && fpi_print_get_type (print) != FPI_PRINT_NBIS &&
@@ -1072,6 +1125,20 @@ index 9500b3ac..65e64d17 100644
            !g_ptr_array_find_with_equal_func (data->gallery, print,
                                               (GEqualFunc) fp_print_equal, NULL))
          {
+diff --git a/libfprint/fpi-device.h b/libfprint/fpi-device.h
+index b17c10df..0f979e36 100644
+--- a/libfprint/fpi-device.h
++++ b/libfprint/fpi-device.h
+@@ -272,6 +272,9 @@ void fpi_device_set_nr_enroll_stages (FpDevice *device,
+ 
+ void fpi_device_set_scan_type (FpDevice  *device,
+                                FpScanType scan_type);
++void fpi_device_set_temperature_limits (FpDevice *device,
++                                        gint32    hot_seconds,
++                                        gint32    cold_seconds);
+ 
+ void fpi_device_update_features (FpDevice       *device,
+                                  FpDeviceFeature update,
 diff --git a/libfprint/fpi-image-device.c b/libfprint/fpi-image-device.c
 index 87bdc600..8d32a58a 100644
 --- a/libfprint/fpi-image-device.c
@@ -1553,6 +1620,115 @@ index 773407d8..ad5b4b26 100644
  /* Helpers to encode metadata into user ID strings. */
  gchar *  fpi_print_generate_user_id (FpPrint *print);
  gboolean fpi_print_fill_from_user_id (FpPrint    *print,
+diff --git a/libfprint/fpi-spi-transfer.c b/libfprint/fpi-spi-transfer.c
+index a0e8ea1d..29fc8d4b 100644
+--- a/libfprint/fpi-spi-transfer.c
++++ b/libfprint/fpi-spi-transfer.c
+@@ -362,6 +362,38 @@ transfer_chunk (FpiSpiTransfer *transfer, gsize full_length, gsize *transferred)
+   return status;
+ }
+ 
++/* One SPI message whose data is split into segments of at most max_chunk
++ * bytes. The chip stays selected for the whole message, unlike the chunked
++ * path which needs the controller to keep it selected between messages. */
++static int
++transfer_segmented (FpiSpiTransfer *transfer)
++{
++  g_autofree struct spi_ioc_transfer *xfer = NULL;
++  gsize n = 0, max = 1;
++
++  if (transfer->buffer_rd)
++    max += (transfer->length_rd + transfer->max_chunk - 1) / transfer->max_chunk;
++  xfer = g_new0 (struct spi_ioc_transfer, max);
++
++  if (transfer->buffer_wr)
++    {
++      xfer[n].tx_buf = (gsize) transfer->buffer_wr;
++      xfer[n].len = transfer->length_wr;
++      n += 1;
++    }
++
++  if (transfer->buffer_rd)
++    for (gsize off = 0; off < (gsize) transfer->length_rd; off += transfer->max_chunk)
++      {
++        xfer[n].rx_buf = (gsize) transfer->buffer_rd + off;
++        xfer[n].len = MIN (transfer->max_chunk, transfer->length_rd - off);
++        n += 1;
++      }
++
++  /* This ioctl cannot be interrupted. */
++  return ioctl (transfer->spidev_fd, SPI_IOC_MESSAGE (n), xfer);
++}
++
+ static void
+ transfer_thread_func (GTask        *task,
+                       gpointer      source_object,
+@@ -388,8 +420,12 @@ transfer_thread_func (GTask        *task,
+   if (transfer->buffer_rd)
+     full_length += transfer->length_rd;
+ 
+-  while (transferred < full_length && status >= 0)
+-    status = transfer_chunk (transfer, full_length, &transferred);
++  if (transfer->max_chunk && full_length <= block_size &&
++      (!transfer->buffer_rd || transfer->length_rd > (gssize) transfer->max_chunk))
++    status = transfer_segmented (transfer);
++  else
++    while (transferred < full_length && status >= 0)
++      status = transfer_chunk (transfer, full_length, &transferred);
+ 
+   if (status < 0)
+     {
+@@ -405,6 +441,26 @@ transfer_thread_func (GTask        *task,
+     }
+ }
+ 
++/**
++ * fpi_spi_transfer_set_max_chunk_size:
++ * @transfer: The #FpiSpiTransfer
++ * @max_chunk: Maximum number of bytes per segment, 0 for the default
++ *
++ * Send the transfer as one SPI message whose data is split into segments of
++ * at most @max_chunk bytes; the chip stays selected for the whole message.
++ * Some SPI controllers block a CPU for the whole duration of a segment, so
++ * smaller segments keep that short for latency sensitive work such as audio.
++ * Transfers larger than the spidev buffer use the normal chunked path.
++ */
++void
++fpi_spi_transfer_set_max_chunk_size (FpiSpiTransfer *transfer,
++                                     gsize           max_chunk)
++{
++  g_return_if_fail (transfer != NULL);
++
++  transfer->max_chunk = max_chunk;
++}
++
+ /**
+  * fpi_spi_transfer_submit:
+  * @transfer: (transfer full): The transfer to submit, must have been filled.
+diff --git a/libfprint/fpi-spi-transfer.h b/libfprint/fpi-spi-transfer.h
+index 755b405f..98284d30 100644
+--- a/libfprint/fpi-spi-transfer.h
++++ b/libfprint/fpi-spi-transfer.h
+@@ -73,6 +73,9 @@ struct _FpiSpiTransfer
+   /* Data free function */
+   GDestroyNotify free_buffer_wr;
+   GDestroyNotify free_buffer_rd;
++
++  /* Upper bound for one kernel transfer (0 = spidev buffer size) */
++  gsize max_chunk;
+ };
+ 
+ GType              fpi_spi_transfer_get_type (void) G_GNUC_CONST;
+@@ -99,6 +102,9 @@ void               fpi_spi_transfer_read_full (FpiSpiTransfer *transfer,
+                                                gsize           length,
+                                                GDestroyNotify  free_func);
+ 
++void               fpi_spi_transfer_set_max_chunk_size (FpiSpiTransfer *transfer,
++                                                        gsize           max_chunk);
++
+ void               fpi_spi_transfer_submit (FpiSpiTransfer        *transfer,
+                                             GCancellable          *cancellable,
+                                             FpiSpiTransferCallback callback,
 diff --git a/libfprint/meson.build b/libfprint/meson.build
 index f11533ca..78d8e87e 100644
 --- a/libfprint/meson.build
